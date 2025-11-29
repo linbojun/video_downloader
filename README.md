@@ -138,6 +138,9 @@ python main.py --mode headless --url <视频网页URL> --output-dir ./downloads
 # 下载 Bilibili 视频
 python main.py --mode headless --url https://www.bilibili.com/video/BVxxxxx --output-dir ./downloads
 
+# 强制使用已安装的 Chrome（解决 HTML5 播放器兼容问题）
+python main.py --mode headless --url https://www.bilibili.com/video/BVxxxxx --output-dir ./downloads --browser-channel chrome
+
 # 使用 Firefox 浏览器
 python main.py --mode headless --url <URL> --output-dir ./downloads --browser-type firefox
 
@@ -153,6 +156,7 @@ python main.py --mode headless --url <URL> --output-dir ./downloads --no-headles
 - `--headless`: 使用无头模式（默认: True）
 - `--no-headless`: 显示浏览器窗口
 - `--browser-type`: 浏览器类型 (`chromium`, `firefox`, `webkit`，默认: `chromium`)
+- `--browser-channel`: Playwright 浏览器通道，仅对 `chromium` 生效（示例：`chrome`, `chrome-beta`, `msedge`）
 - `--timeout`: 超时时间，单位毫秒（默认: 30000）
 
 ### 方案 B：浏览器脚本模式
@@ -249,6 +253,14 @@ video_downloader/
 - 尝试使用 `--no-headless` 模式，手动登录后再运行
 - 等待视频开始播放后再提取 URL
 - 检查浏览器 Network 标签中的视频请求
+
+### Q: Bilibili 提示“您的浏览器不支持 HTML5 播放器”？
+
+**A:** Playwright 自带的 Chromium 精简了 Google 的专有编解码器（H.264/AAC）和 Widevine DRM，Bilibili 会因此拒绝播放。解决方法：
+
+- 安装官方 Chrome / Edge 浏览器（大多数系统已自带）
+- 启动命令中追加 `--browser-channel chrome`（或在 Windows 上使用 `--browser-channel msedge`），强制 Playwright 使用真实浏览器进程
+- 如仍有问题，配合 `--no-headless` 手动登录并等待视频加载
 
 ### Q: 需要登录的网站如何处理？
 

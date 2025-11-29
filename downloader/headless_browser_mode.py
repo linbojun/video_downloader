@@ -14,16 +14,23 @@ logger = logging.getLogger(__name__)
 class HeadlessBrowserDownloader:
     """Playwright 无头浏览器下载器"""
     
-    def __init__(self, headless: bool = True, browser_type: str = "chromium"):
+    def __init__(
+        self,
+        headless: bool = True,
+        browser_type: str = "chromium",
+        browser_channel: Optional[str] = None,
+    ):
         """
         初始化 Playwright 浏览器下载器
         
         Args:
             headless: 是否使用无头模式
             browser_type: 浏览器类型 ("chromium", "firefox", "webkit")
+            browser_channel: 浏览器通道 (仅对 chromium 生效，如 "chrome"、"msedge")
         """
         self.headless = headless
         self.browser_type = browser_type
+        self.browser_channel = browser_channel
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
@@ -72,12 +79,24 @@ class HeadlessBrowserDownloader:
         try:
             async with async_playwright() as p:
                 # 启动浏览器
+                launch_kwargs = {"headless": self.headless}
+                
+                if self.browser_channel and self.browser_type != "chromium":
+                    logger.warning(
+                        "browser_channel 仅对 chromium 生效，已忽略该参数"
+                    )
+                
                 if self.browser_type == "chromium":
-                    self.browser = await p.chromium.launch(headless=self.headless)
+                    if self.browser_channel:
+                        launch_kwargs["channel"] = self.browser_channel
+                        logger.info(
+                            f"使用浏览器通道: {self.browser_channel}"
+                        )
+                    self.browser = await p.chromium.launch(**launch_kwargs)
                 elif self.browser_type == "firefox":
-                    self.browser = await p.firefox.launch(headless=self.headless)
+                    self.browser = await p.firefox.launch(**launch_kwargs)
                 elif self.browser_type == "webkit":
-                    self.browser = await p.webkit.launch(headless=self.headless)
+                    self.browser = await p.webkit.launch(**launch_kwargs)
                 else:
                     raise ValueError(f"不支持的浏览器类型: {self.browser_type}")
                 

@@ -84,6 +84,12 @@ def main():
     )
     
     parser.add_argument(
+        '--browser-channel',
+        type=str,
+        help='Playwright 浏览器通道，仅对 chromium 生效 (例如: chrome, chrome-beta, msedge)'
+    )
+    
+    parser.add_argument(
         '--timeout',
         type=int,
         default=30000,
@@ -111,7 +117,8 @@ def main():
             logger.info("使用无头浏览器模式")
             downloader = HeadlessBrowserDownloader(
                 headless=args.headless,
-                browser_type=args.browser_type
+                browser_type=args.browser_type,
+                browser_channel=args.browser_channel
             )
             downloader.run(args.url, str(output_dir))
             
