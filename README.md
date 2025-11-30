@@ -12,13 +12,16 @@
   - MP4 直接下载
   - M3U8 流媒体（使用 ffmpeg 合并）
 
+- 🔄 **自动合并音视频**：检测 DASH `.m4s`（如 Bilibili）并用 ffmpeg 合并为 MP4，成功后清理原始分片
 - 🌐 **跨平台支持**：macOS、Windows、Linux
 
 - 🔧 **易于使用**：简单的 CLI 接口
 
 ## 📋 环境要求
 
-- **Python**: 3.9 或更高版本
+- **Python**: 3.8 或更高版本（推荐 3.10+）
+- **PyPI 依赖**：`playwright`、`requests`
+  - `pip install -r requirements.txt` 会一次性安装
 - **Playwright**: 通过 `pip install playwright` 安装
 - **ffmpeg**: 用于处理 M3U8 流媒体（需要单独安装）
 
@@ -141,12 +144,49 @@ python main.py --mode headless --url https://www.bilibili.com/video/BVxxxxx --ou
 # 强制使用已安装的 Chrome（解决 HTML5 播放器兼容问题）
 python main.py --mode headless --url https://www.bilibili.com/video/BVxxxxx --output-dir ./downloads --browser-channel chrome
 
+# 复用当前 Chrome 配置（沿用 Widevine/登录状态）
+python main.py --mode headless --url https://www.bilibili.com/video/BVxxxxx --output-dir ./downloads --browser-channel chrome --user-data-dir "~/Library/Application Support/Google/Chrome/Default"
+
+> 提示：Chromium 模式默认注入 Anti-automation Stealth 补丁（伪装 `navigator.webdriver`、`plugins`、`sec-ch-ua` 等），帮助绕过 Bilibili 对无头浏览器的卡 loading 检测。若页面仍然停留在“加载中”，请配合 `--no-headless`、`--browser-channel chrome` 并复用本机浏览器配置（`--user-data-dir`），确保 Widevine 模块及 Cookies 已加载。
+
 # 使用 Firefox 浏览器
 python main.py --mode headless --url <URL> --output-dir ./downloads --browser-type firefox
 
 # 显示浏览器窗口（调试用）
 python main.py --mode headless --url <URL> --output-dir ./downloads --no-headless
 ```
+
+#### Bilibili 实战示例（macOS + Chrome Profile 1）
+
+以下命令在 `zsh` 中实测通过，针对 Bilibili BV 号 `BV1FYtHzEEAF`，复用本机 Chrome「Profile 1」并强制开启有头模式，确保 Widevine、Cookies 及登录态全部可用：
+
+```bash
+python main.py --mode headless \
+  --url "https://www.bilibili.com/video/BV1FYtHzEEAF" \
+  --browser-channel chrome \
+  --user-data-dir "/Users/bojun/Library/Application Support/Google/Chrome/Profile 1" \
+  --no-headless
+```
+
+- `--browser-channel chrome`：调用系统已安装的稳定版 Chrome，避免 B 站检测出精简版 Chromium 缺少解码器。
+- `--user-data-dir "/Users/bojun/Library/Application Support/Google/Chrome/Profile 1"`：复用本机 Profile 1（包含 Widevine 模块、登录态、Cookies）。
+- `--no-headless`：调试期间显示真实浏览器窗口，可手动完成登录或验证播放器状态。
+- 若页面长时间 Loading，可在执行前关闭所有已打开的 Chrome 窗口，确保 Playwright 得以独占该用户目录。
+
+#### 抖音网页端示例（需要可见浏览器）
+
+抖音通常要求登录并依赖可见播放界面，下方命令展示如何在 `zsh` 中抓取作品 `7558494983238536490` 的直链，运行后可在浏览器里完成扫码/短信登录：
+
+```bash
+python main.py --mode headless \
+  --url https://www.douyin.com/video/7558494983238536490 \
+  --output-dir ./downloads \
+  --no-headless
+```
+
+- Douyin 为动态渲染页面，`--no-headless` 可避免人机校验失败，同时方便观察播放状态。
+- 若页面提示“当前地区无法观看”，可在同一窗口内手动切换账号或开启代理，程序会在后台继续监听请求。
+- 运行完成后，音视频分轨将自动合并成单个 MP4 文件，输出在 `./downloads` 目录。
 
 #### 参数说明
 
@@ -157,7 +197,8 @@ python main.py --mode headless --url <URL> --output-dir ./downloads --no-headles
 - `--no-headless`: 显示浏览器窗口
 - `--browser-type`: 浏览器类型 (`chromium`, `firefox`, `webkit`，默认: `chromium`)
 - `--browser-channel`: Playwright 浏览器通道，仅对 `chromium` 生效（示例：`chrome`, `chrome-beta`, `msedge`）
-- `--timeout`: 超时时间，单位毫秒（默认: 30000）
+- `--user-data-dir`: 复用已有浏览器用户数据目录（仅 `chromium` 支持，如 `~/Library/Application Support/Google/Chrome/Default`）。若同时指定 `--browser-channel chrome` 与 `--no-headless` 且未填写该参数，程序会默认使用 `/Users/bojun/Library/Application Support/Google/Chrome/Profile 1`
+- `--timeout`: 超时时间，单位毫秒（默认: 90000）
 
 ### 方案 B：浏览器脚本模式
 
@@ -254,13 +295,21 @@ video_downloader/
 - 等待视频开始播放后再提取 URL
 - 检查浏览器 Network 标签中的视频请求
 
+
 ### Q: Bilibili 提示“您的浏览器不支持 HTML5 播放器”？
 
 **A:** Playwright 自带的 Chromium 精简了 Google 的专有编解码器（H.264/AAC）和 Widevine DRM，Bilibili 会因此拒绝播放。解决方法：
 
 - 安装官方 Chrome / Edge 浏览器（大多数系统已自带）
 - 启动命令中追加 `--browser-channel chrome`（或在 Windows 上使用 `--browser-channel msedge`），强制 Playwright 使用真实浏览器进程
-- 如仍有问题，配合 `--no-headless` 手动登录并等待视频加载
+- 项目默认会在 Chromium 模式下注入 Stealth 补丁（伪装 `navigator.webdriver`、`permissions.query` 等），避免播放器识别出自动化脚本
+- 如仍有问题：
+  - 关闭本机已打开的 Chrome 窗口
+  - 指定 `--user-data-dir` 为本机真实配置，确保 Widevine 与 Cookies 得以复用。常见路径：
+    - **macOS:** `~/Library/Application Support/Google/Chrome/Default`
+    - **Windows:** `%LOCALAPPDATA%\Google\Chrome\User Data\Default`
+    - **Linux:** `~/.config/google-chrome/Default`
+  - 配合 `--no-headless` 手动登录并等待视频加载
 
 ### Q: 需要登录的网站如何处理？
 
@@ -282,7 +331,8 @@ video_downloader/
 **A:** 
 - M3U8 是流媒体播放列表，需要使用 ffmpeg 合并
 - 程序会自动使用 ffmpeg 处理 M3U8 文件
-- 如果失败，检查 ffmpeg 是否正确安装
+- 若是 Bilibili 等 DASH `.m4s` 片段，程序会自动合并音/视频轨并删除原始分片
+- 如果自动合并失败，请检查 ffmpeg 是否正确安装
 
 ### Q: 支持哪些视频网站？
 

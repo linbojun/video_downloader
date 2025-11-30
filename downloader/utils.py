@@ -6,13 +6,18 @@ import subprocess
 import logging
 import requests
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
 
-def download_mp4(url: str, output_path: str, chunk_size: int = 8192) -> bool:
+def download_mp4(
+    url: str,
+    output_path: str,
+    chunk_size: int = 8192,
+    headers: Optional[Dict[str, str]] = None,
+) -> bool:
     """
     下载 MP4 视频文件
     
@@ -26,7 +31,7 @@ def download_mp4(url: str, output_path: str, chunk_size: int = 8192) -> bool:
     """
     try:
         logger.info(f"开始下载 MP4: {url}")
-        response = requests.get(url, stream=True, timeout=30)
+        response = requests.get(url, stream=True, timeout=30, headers=headers)
         response.raise_for_status()
         
         total_size = int(response.headers.get('content-length', 0))
@@ -134,13 +139,16 @@ def is_video_url(url: str) -> bool:
     if not url:
         return False
     
-    url_lower = url.lower()
-    video_extensions = ['.m3u8', '.mp4', '.webm', '.flv', '.avi', '.mov']
+    video_extensions = ['.m3u8', '.mp4', '.webm', '.flv', '.avi', '.mov', '.m4s', '.mpd']
     
-    # 检查文件扩展名
-    for ext in video_extensions:
-        if ext in url_lower:
-            return True
+    try:
+        parsed = urlparse(url)
+        path = parsed.path.lower()
+        for ext in video_extensions:
+            if path.endswith(ext):
+                return True
+    except Exception:
+        return False
     
     return False
 
@@ -189,7 +197,13 @@ def get_video_filename(url: str, index: Optional[int] = None, default_name: str 
     return f"{default_name}.mp4"
 
 
-def download_video(url: str, output_dir: str, filename: Optional[str] = None, index: Optional[int] = None) -> Optional[str]:
+def download_video(
+    url: str,
+    output_dir: str,
+    filename: Optional[str] = None,
+    index: Optional[int] = None,
+    headers: Optional[Dict[str, str]] = None,
+) -> Optional[str]:
     """
     通用视频下载函数，自动识别 mp4 或 m3u8
     
@@ -211,14 +225,17 @@ def download_video(url: str, output_dir: str, filename: Optional[str] = None, in
         output_path = os.path.join(output_dir, filename)
         
         url_lower = url.lower()
+        parsed_path = urlparse(url).path.lower()
+        binary_exts = ['.mp4', '.m4s', '.webm', '.flv', '.avi', '.mov']
+        
         if '.m3u8' in url_lower:
             success = download_m3u8(url, output_path)
-        elif '.mp4' in url_lower or url_lower.startswith('http'):
+        elif any(parsed_path.endswith(ext) for ext in binary_exts) or url_lower.startswith('http'):
             # 假设是 mp4 或其他视频格式
-            success = download_mp4(url, output_path)
+            success = download_mp4(url, output_path, headers=headers)
         else:
             logger.warning(f"无法识别视频格式，尝试作为 MP4 下载: {url}")
-            success = download_mp4(url, output_path)
+            success = download_mp4(url, output_path, headers=headers)
         
         if success and os.path.exists(output_path):
             return output_path
@@ -229,7 +246,11 @@ def download_video(url: str, output_dir: str, filename: Optional[str] = None, in
         return None
 
 
-def download_videos(video_urls: List[str], output_dir: str) -> List[str]:
+def download_videos(
+    video_urls: List[str],
+    output_dir: str,
+    headers_map: Optional[Dict[str, Dict[str, str]]] = None,
+) -> List[str]:
     """
     批量下载视频
     
@@ -244,11 +265,208 @@ def download_videos(video_urls: List[str], output_dir: str) -> List[str]:
     
     for i, url in enumerate(video_urls):
         logger.info(f"下载视频 {i+1}/{len(video_urls)}: {url}")
-        file_path = download_video(url, output_dir, index=i if len(video_urls) > 1 else None)
+        headers = headers_map.get(url) if headers_map else None
+        file_path = download_video(
+            url,
+            output_dir,
+            index=i if len(video_urls) > 1 else None,
+            headers=headers,
+        )
         if file_path:
             downloaded_files.append(file_path)
         else:
             logger.warning(f"跳过失败的视频: {url}")
     
     return downloaded_files
+
+
+def auto_mux_downloads(downloaded_files: List[str], output_dir: str) -> List[str]:
+    """
+    自动检测并合并分离的音视频流（例如 Bilibili DASH 的 .m4s）
+    
+    Args:
+        downloaded_files: 下载得到的原始文件路径
+        output_dir: 输出目录
+        
+    Returns:
+        List[str]: 成功合并后的文件路径列表
+    """
+    if len(downloaded_files) < 2:
+        return []
+    
+    if not check_ffmpeg_available():
+        logger.debug("ffmpeg 不可用，跳过自动合并")
+        return []
+    
+    video_only: List[str] = []
+    audio_only: List[str] = []
+    
+    for file_path in downloaded_files:
+        profile = _probe_stream_profile(file_path)
+        if not profile:
+            continue
+        video_streams, audio_streams = profile
+        if video_streams > 0 and audio_streams == 0:
+            video_only.append(file_path)
+        elif audio_streams > 0 and video_streams == 0:
+            audio_only.append(file_path)
+    
+    if not video_only or not audio_only:
+        return []
+    
+    audio_map = _group_by_base(audio_only)
+    muxed_files: List[str] = []
+    for idx, video_path in enumerate(video_only):
+        audio_path = _pop_matching_audio(audio_map, video_path)
+        if not audio_path:
+            logger.debug(f"未找到匹配音频，跳过: {video_path}")
+            continue
+        output_path = _build_mux_output_path(video_path, audio_path, output_dir, idx)
+        if mux_streams(video_path, audio_path, output_path):
+            muxed_files.append(output_path)
+            _delete_file_safely(video_path)
+            _delete_file_safely(audio_path)
+    
+    if muxed_files:
+        logger.info(f"自动合并完成 {len(muxed_files)} 个文件")
+    return muxed_files
+
+
+def mux_streams(video_path: str, audio_path: str, output_path: str) -> bool:
+    """
+    使用 ffmpeg 合并独立的音轨/视频轨
+    """
+    try:
+        logger.info(f"开始合并音视频: {video_path} + {audio_path} → {output_path}")
+        cmd = [
+            'ffmpeg',
+            '-y',
+            '-loglevel', 'error',
+            '-i', video_path,
+            '-i', audio_path,
+            '-c:v', 'copy',
+            '-c:a', 'copy',
+            output_path
+        ]
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=600
+        )
+        if result.returncode == 0 and os.path.exists(output_path):
+            logger.info(f"合并完成: {output_path}")
+            return True
+        logger.error(f"合并失败: {result.stderr.strip()}")
+        return False
+    except subprocess.TimeoutExpired:
+        logger.error("ffmpeg 合并超时")
+        return False
+    except FileNotFoundError:
+        logger.error("未找到 ffmpeg，请确认已安装并在 PATH 中")
+        return False
+    except Exception as err:
+        logger.error(f"合并音视频失败: {err}")
+        return False
+
+
+def _probe_stream_profile(file_path: str) -> Optional[Tuple[int, int]]:
+    """
+    使用 ffprobe 检测文件内音轨/视频轨数量
+    """
+    if not os.path.exists(file_path):
+        return None
+    try:
+        cmd = [
+            'ffprobe',
+            '-v', 'error',
+            '-show_entries', 'stream=codec_type',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            file_path
+        ]
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if result.returncode != 0:
+            logger.debug(f"ffprobe 解析失败: {result.stderr.strip()}")
+            return None
+        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        video_streams = sum(1 for line in lines if line == 'video')
+        audio_streams = sum(1 for line in lines if line == 'audio')
+        return video_streams, audio_streams
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        logger.debug("ffprobe 不可用或执行超时，跳过流信息检测")
+        return None
+    except Exception as err:
+        logger.debug(f"检测媒体信息失败: {err}")
+        return None
+
+
+def _build_mux_output_path(
+    video_path: str,
+    audio_path: str,
+    output_dir: str,
+    index: int
+) -> str:
+    video_base = _normalize_stem(Path(video_path).stem)
+    audio_base = _normalize_stem(Path(audio_path).stem)
+    base_name = _derive_common_prefix(video_base, audio_base) or "merged"
+    
+    candidate = Path(output_dir) / f"{base_name}.mp4"
+    suffix = 1
+    while candidate.exists():
+        candidate = Path(output_dir) / f"{base_name}_{suffix}.mp4"
+        suffix += 1
+    return str(candidate)
+
+
+def _normalize_stem(stem: str) -> str:
+    if '_' in stem:
+        stem = stem.rsplit('_', 1)[0]
+    return stem.strip().strip("-_.")
+
+
+def _derive_common_prefix(a: str, b: str) -> str:
+    if a == b:
+        return a
+    prefix = os.path.commonprefix([a, b]).rstrip("-_.")
+    return prefix
+
+
+def _group_by_base(paths: List[str]) -> Dict[str, List[str]]:
+    grouped: Dict[str, List[str]] = {}
+    for path in paths:
+        base = _normalize_stem(Path(path).stem) or Path(path).stem
+        grouped.setdefault(base, []).append(path)
+    return grouped
+
+
+def _pop_matching_audio(audio_map: Dict[str, List[str]], video_path: str) -> Optional[str]:
+    base = _normalize_stem(Path(video_path).stem)
+    candidates = audio_map.get(base)
+    if candidates:
+        path = candidates.pop(0)
+        if not candidates:
+            audio_map.pop(base, None)
+        return path
+    # fallback to any remaining audio
+    for key, values in list(audio_map.items()):
+        if values:
+            path = values.pop(0)
+            if not values:
+                audio_map.pop(key, None)
+            return path
+    return None
+
+
+def _delete_file_safely(path: str) -> None:
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+            logger.debug(f"已删除原始文件: {path}")
+    except Exception as err:
+        logger.debug(f"删除文件失败 {path}: {err}")
 

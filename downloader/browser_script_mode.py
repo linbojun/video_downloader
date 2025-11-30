@@ -6,7 +6,7 @@ import json
 import logging
 import sys
 from typing import List
-from .utils import download_videos
+from .utils import download_videos, auto_mux_downloads
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +96,9 @@ def download_videos_from_urls(video_urls: List[str], output_dir: str) -> None:
     logger.info(f"开始下载 {len(video_urls)} 个视频到: {output_dir}")
     downloaded_files = download_videos(video_urls, output_dir)
     logger.info(f"成功下载 {len(downloaded_files)} 个视频")
+    muxed_files = auto_mux_downloads(downloaded_files, output_dir)
+    if muxed_files:
+        logger.info(f"已自动合并输出文件: {muxed_files}")
 
 
 def run(output_dir: str) -> None:

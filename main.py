@@ -12,6 +12,8 @@ from pathlib import Path
 from downloader.headless_browser_mode import HeadlessBrowserDownloader
 from downloader.browser_script_mode import run as run_browser_script_mode
 
+DEFAULT_CHROME_PROFILE = "/Users/bojun/Library/Application Support/Google/Chrome/Profile 1"
+
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
@@ -90,13 +92,30 @@ def main():
     )
     
     parser.add_argument(
+        '--user-data-dir',
+        type=str,
+        help='复用已有浏览器用户数据目录（Chromium 专用，例如: ~/Library/Application Support/Google/Chrome/Default）'
+    )
+    
+    parser.add_argument(
         '--timeout',
         type=int,
-        default=30000,
-        help='超时时间（毫秒）(默认: 30000)'
+        default=90000,
+        help='超时时间（毫秒）(默认: 90000)'
     )
     
     args = parser.parse_args()
+    if (
+        args.browser_channel == 'chrome'
+        and args.headless is False
+        and not args.user_data_dir
+    ):
+        default_profile = Path(DEFAULT_CHROME_PROFILE)
+        args.user_data_dir = str(default_profile)
+        logger.info(
+            "检测到 chrome + --no-headless，默认使用用户数据目录: %s",
+            args.user_data_dir,
+        )
     
     # 创建输出目录
     output_dir = Path(args.output_dir)
@@ -118,9 +137,10 @@ def main():
             downloader = HeadlessBrowserDownloader(
                 headless=args.headless,
                 browser_type=args.browser_type,
-                browser_channel=args.browser_channel
+                browser_channel=args.browser_channel,
+                user_data_dir=args.user_data_dir
             )
-            downloader.run(args.url, str(output_dir))
+            downloader.run(args.url, str(output_dir), timeout=args.timeout)
             
         elif args.mode == 'browser_script':
             # 方案 B: 浏览器脚本模式
