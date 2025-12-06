@@ -229,6 +229,9 @@ def download_video(
         binary_exts = ['.mp4', '.m4s', '.webm', '.flv', '.avi', '.mov']
         
         if '.m3u8' in url_lower:
+            # 确保 m3u8 输出为 .mp4 格式
+            if output_path.endswith('.m3u8'):
+                output_path = os.path.splitext(output_path)[0] + '.mp4'
             success = download_m3u8(url, output_path)
         elif any(parsed_path.endswith(ext) for ext in binary_exts) or url_lower.startswith('http'):
             # 假设是 mp4 或其他视频格式
@@ -463,10 +466,286 @@ def _pop_matching_audio(audio_map: Dict[str, List[str]], video_path: str) -> Opt
 
 
 def _delete_file_safely(path: str) -> None:
+    """
+    安全删除文件
+    
+    Args:
+        path: 文件路径
+    """
     try:
         if path and os.path.exists(path):
             os.remove(path)
-            logger.debug(f"已删除原始文件: {path}")
+            logger.info(f"已删除文件: {os.path.basename(path)}")
+        elif path:
+            logger.debug(f"文件不存在，跳过删除: {os.path.basename(path)}")
     except Exception as err:
-        logger.debug(f"删除文件失败 {path}: {err}")
+        logger.warning(f"删除文件失败 {os.path.basename(path)}: {err}")
+
+
+def merge_ts_files(ts_files: List[str], output_path: str) -> bool:
+    """
+    使用 ffmpeg 合并多个 .ts 文件
+    
+    Args:
+        ts_files: .ts 文件路径列表（已排序）
+        output_path: 输出文件路径
+        
+    Returns:
+        bool: 是否合并成功
+    """
+    if not ts_files:
+        return False
+    
+    if not check_ffmpeg_available():
+        logger.error("ffmpeg 不可用，无法合并 .ts 文件")
+        return False
+    
+    try:
+        logger.info(f"开始合并 {len(ts_files)} 个 .ts 文件 → {output_path}")
+        
+        # 创建临时文件列表用于 ffmpeg concat demuxer
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            for ts_file in ts_files:
+                # 使用绝对路径，避免相对路径问题
+                abs_path = os.path.abspath(ts_file)
+                f.write(f"file '{abs_path}'\n")
+            concat_list_path = f.name
+        
+        try:
+            # 使用 ffmpeg concat demuxer 合并
+            cmd = [
+                'ffmpeg',
+                '-y',  # 覆盖输出文件
+                '-f', 'concat',
+                '-safe', '0',
+                '-i', concat_list_path,
+                '-c', 'copy',  # 直接复制流，不重新编码
+                output_path
+            ]
+            
+            logger.debug(f"执行命令: {' '.join(cmd)}")
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=600  # 10分钟超时
+            )
+            
+            if result.returncode == 0 and os.path.exists(output_path):
+                logger.info(f".ts 文件合并完成: {output_path}")
+                return True
+            else:
+                logger.error(f"ffmpeg 合并失败: {result.stderr}")
+                return False
+        finally:
+            # 清理临时文件
+            try:
+                os.remove(concat_list_path)
+            except Exception:
+                pass
+                
+    except subprocess.TimeoutExpired:
+        logger.error("合并 .ts 文件超时")
+        return False
+    except Exception as e:
+        logger.error(f"合并 .ts 文件失败: {e}")
+        return False
+
+
+def detect_and_merge_ts_files(downloaded_files: List[str], output_dir: str) -> List[str]:
+    """
+    检测下载的 .ts 文件并合并为完整视频
+    
+    Args:
+        downloaded_files: 下载得到的文件路径列表
+        output_dir: 输出目录
+        
+    Returns:
+        List[str]: 合并后的文件路径列表
+    """
+    if not downloaded_files:
+        return []
+    
+    # 筛选出 .ts 文件
+    ts_files = [f for f in downloaded_files if f.endswith('.ts')]
+    if len(ts_files) < 2:
+        # 少于2个 .ts 文件，不需要合并
+        return []
+    
+    logger.info(f"检测到 {len(ts_files)} 个 .ts 文件，开始分组合并...")
+    
+    # 按文件名分组 .ts 文件
+    # 例如: index0.ts, index1.ts, index2.ts 应该合并
+    # 或者: index_50.ts, index_51.ts, index_52.ts 应该合并
+    ts_groups = _group_ts_files(ts_files)
+    
+    if not ts_groups:
+        logger.debug("未能识别 .ts 文件分组模式")
+        return []
+    
+    merged_files = []
+    for group_name, group_files in ts_groups.items():
+        if len(group_files) < 2:
+            continue
+        
+        # 排序文件（按数字顺序）
+        sorted_files = _sort_ts_files(group_files)
+        
+        # 生成输出文件名
+        output_filename = _generate_merged_filename(group_name, output_dir)
+        output_path = os.path.join(output_dir, output_filename)
+        
+        # 合并文件
+        if merge_ts_files(sorted_files, output_path):
+            merged_files.append(output_path)
+            logger.info(f"合并成功，开始删除 {len(sorted_files)} 个原始 .ts 文件...")
+            # 删除原始 .ts 文件
+            deleted_count = 0
+            for ts_file in sorted_files:
+                if os.path.exists(ts_file):
+                    _delete_file_safely(ts_file)
+                    deleted_count += 1
+            logger.info(f"已合并 {len(sorted_files)} 个 .ts 文件为: {os.path.basename(output_path)}，已删除 {deleted_count} 个原始文件")
+        else:
+            logger.warning(f"合并失败，保留原始 .ts 文件: {group_name}")
+    
+    if merged_files:
+        logger.info(f"成功合并 {len(merged_files)} 组 .ts 文件")
+    
+    return merged_files
+
+
+def _group_ts_files(ts_files: List[str]) -> Dict[str, List[str]]:
+    """
+    将 .ts 文件按命名模式分组
+    
+    Args:
+        ts_files: .ts 文件路径列表
+        
+    Returns:
+        Dict[str, List[str]]: 分组后的文件，key 为组名，value 为文件列表
+    """
+    import re
+    groups: Dict[str, List[str]] = {}
+    
+    for ts_file in ts_files:
+        filename = os.path.basename(ts_file)
+        name_without_ext = os.path.splitext(filename)[0]
+        
+        # 模式1: index0_2, index1_4 (下载时添加了索引后缀)
+        # 匹配: base_name + segment_number + _ + download_index
+        # 例如: index0_2 -> base: index, segment: 0
+        match1 = re.match(r'^(.+?)(\d+)_\d+$', name_without_ext)
+        if match1:
+            base_name = match1.group(1)
+            groups.setdefault(base_name, []).append(ts_file)
+            continue
+        
+        # 模式2: index0, index1, index2 (数字在末尾，无下载索引)
+        match2 = re.match(r'^(.+?)(\d+)$', name_without_ext)
+        if match2:
+            base_name = match2.group(1)
+            groups.setdefault(base_name, []).append(ts_file)
+            continue
+        
+        # 模式3: index_50_2, index_51_4 (下划线分隔 + 下载索引)
+        match3 = re.match(r'^(.+?)_(\d+)_\d+$', name_without_ext)
+        if match3:
+            base_name = match3.group(1)
+            groups.setdefault(base_name, []).append(ts_file)
+            continue
+        
+        # 模式4: index_50, index_51, index_52 (下划线分隔，无下载索引)
+        match4 = re.match(r'^(.+?)_(\d+)$', name_without_ext)
+        if match4:
+            base_name = match4.group(1)
+            groups.setdefault(base_name, []).append(ts_file)
+            continue
+        
+        # 模式5: 如果无法匹配，尝试提取公共前缀
+        # 移除下载索引后缀（最后一个下划线和数字）
+        fallback_name = re.sub(r'_\d+$', '', name_without_ext)
+        if fallback_name != name_without_ext:
+            groups.setdefault(fallback_name, []).append(ts_file)
+        else:
+            # 最后的后备方案：使用默认组
+            if 'default' not in groups:
+                groups['default'] = []
+            groups['default'].append(ts_file)
+    
+    # 过滤掉只有1个文件的组
+    return {k: v for k, v in groups.items() if len(v) >= 2}
+
+
+def _sort_ts_files(ts_files: List[str]) -> List[str]:
+    """
+    按数字顺序排序 .ts 文件
+    
+    Args:
+        ts_files: .ts 文件路径列表
+        
+    Returns:
+        List[str]: 排序后的文件路径列表
+    """
+    import re
+    
+    def extract_number(filepath: str) -> int:
+        """从文件路径中提取片段序号用于排序（忽略下载索引）"""
+        filename = os.path.basename(filepath)
+        name_without_ext = os.path.splitext(filename)[0]
+        
+        # 模式1: index0_2 -> 提取 segment number (0)，忽略下载索引 (2)
+        match = re.match(r'^.+?(\d+)_\d+$', name_without_ext)
+        if match:
+            return int(match.group(1))
+        
+        # 模式2: index_50_2 -> 提取 segment number (50)，忽略下载索引 (2)
+        match = re.match(r'^.+?_(\d+)_\d+$', name_without_ext)
+        if match:
+            return int(match.group(1))
+        
+        # 模式3: index0 -> 提取末尾数字 (0)
+        match = re.search(r'(\d+)$', name_without_ext)
+        if match:
+            return int(match.group(1))
+        
+        # 模式4: index_50 -> 提取下划线后的数字 (50)
+        match = re.search(r'_(\d+)$', name_without_ext)
+        if match:
+            return int(match.group(1))
+        
+        # 如果无法提取，返回0
+        return 0
+    
+    return sorted(ts_files, key=extract_number)
+
+
+def _generate_merged_filename(group_name: str, output_dir: str) -> str:
+    """
+    生成合并后的文件名
+    
+    Args:
+        group_name: 组名（例如 "index"）
+        output_dir: 输出目录
+        
+    Returns:
+        str: 文件名
+    """
+    # 清理组名，移除特殊字符
+    clean_name = group_name.strip('_-').replace('_', '-')
+    if not clean_name:
+        clean_name = "merged"
+    
+    output_filename = f"{clean_name}_merged.mp4"
+    output_path = os.path.join(output_dir, output_filename)
+    
+    # 如果文件已存在，添加序号
+    counter = 1
+    while os.path.exists(output_path):
+        output_filename = f"{clean_name}_merged_{counter}.mp4"
+        output_path = os.path.join(output_dir, output_filename)
+        counter += 1
+    
+    return output_filename
 

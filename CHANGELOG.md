@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.6] - 2025-12-06
+
+### Added
+- 自动检测并合并 HLS 视频的 .ts 片段文件
+  - 当视频以多个 .ts 文件形式下载时，自动识别并合并为完整视频
+  - 支持多种命名模式（index0.ts, index1.ts 或 index_50.ts, index_51.ts 等）
+  - 合并成功后自动删除原始 .ts 文件
+  - 使用 ffmpeg concat demuxer 进行高效合并（无需重新编码）
+
+### Fixed
+- 修复 m3u8 下载时输出文件扩展名问题，确保输出为 .mp4 格式而非 .m3u8 文件
+- **重要修复**：当检测到 m3u8 URL 时，自动跳过下载属于同一流的 .ts 文件
+  - 解决浏览器只捕获部分 .ts 片段导致合并视频不完整的问题
+  - 优先使用 m3u8 下载完整视频，避免下载不完整的 .ts 片段
+  - 显著减少不必要的下载和存储空间浪费
+
 ## [0.1.5] - 2025-11-29
 
 ### Added

@@ -13,7 +13,7 @@ from playwright.async_api import (
     Browser,
     BrowserContext,
 )
-from .utils import download_video, get_video_filename, is_video_url, auto_mux_downloads
+from .utils import download_video, get_video_filename, is_video_url, auto_mux_downloads, detect_and_merge_ts_files
 
 logger = logging.getLogger(__name__)
 
@@ -420,14 +420,56 @@ class HeadlessBrowserDownloader:
             return
         
         logger.info(f"开始下载 {len(video_urls)} 个视频到: {output_dir}")
-        headers_map = {}
+        
+        # 识别 m3u8 URL 及其基础路径，用于过滤掉属于同一流的 .ts 文件
+        m3u8_base_paths = set()
+        m3u8_urls = []
         for url in video_urls:
+            if '.m3u8' in url.lower():
+                m3u8_urls.append(url)
+                # 提取 m3u8 的基础路径（例如: /hls/1011435/index.m3u8 -> /hls/1011435/）
+                parsed = urlparse(url)
+                path = parsed.path
+                # 移除文件名，获取目录路径
+                if '/' in path:
+                    base_path = path[:path.rfind('/') + 1]
+                    m3u8_base_paths.add(base_path)
+                    logger.debug(f"检测到 m3u8 基础路径: {base_path} (来自: {url})")
+        
+        if m3u8_urls:
+            logger.info(f"检测到 {len(m3u8_urls)} 个 m3u8 流，将优先使用 m3u8 下载完整视频")
+        
+        # 过滤掉属于 m3u8 流的 .ts 文件（避免重复下载）
+        filtered_urls = []
+        skipped_ts_count = 0
+        for url in video_urls:
+            if url.lower().endswith('.ts'):
+                # 检查这个 .ts 文件是否属于某个已检测到的 m3u8 流
+                parsed = urlparse(url)
+                path = parsed.path
+                is_part_of_m3u8 = False
+                for base_path in m3u8_base_paths:
+                    if path.startswith(base_path):
+                        is_part_of_m3u8 = True
+                        skipped_ts_count += 1
+                        logger.debug(f"跳过 .ts 文件（属于 m3u8 流）: {url}")
+                        break
+                if not is_part_of_m3u8:
+                    filtered_urls.append(url)
+            else:
+                filtered_urls.append(url)
+        
+        if skipped_ts_count > 0:
+            logger.info(f"检测到 m3u8 流，已跳过 {skipped_ts_count} 个 .ts 文件（将使用 m3u8 下载完整视频）")
+        
+        headers_map = {}
+        for url in filtered_urls:
             headers_map[url] = self.video_request_meta.get(url) or self._prepare_download_headers({})
         
         downloaded_files: List[str] = []
-        total = len(video_urls)
+        total = len(filtered_urls)
         
-        for i, url in enumerate(video_urls):
+        for i, url in enumerate(filtered_urls):
             headers = headers_map.get(url)
             try:
                 file_path = download_video(
@@ -447,6 +489,16 @@ class HeadlessBrowserDownloader:
             return
         
         logger.info(f"成功下载 {len(downloaded_files)} 个视频")
+        
+        # 检测并合并 .ts 文件（HLS 视频片段）
+        # 注意：如果已有 m3u8 下载，通常不会有 .ts 文件需要合并
+        merged_ts_files = detect_and_merge_ts_files(downloaded_files, output_dir)
+        if merged_ts_files:
+            logger.info(f"已合并 .ts 文件: {merged_ts_files}")
+            # 从 downloaded_files 中移除已合并的 .ts 文件
+            downloaded_files = [f for f in downloaded_files if not f.endswith('.ts')]
+        
+        # 自动合并分离的音视频流（例如 Bilibili DASH 的 .m4s）
         muxed_files = auto_mux_downloads(downloaded_files, output_dir)
         if muxed_files:
             logger.info(f"生成合并文件: {muxed_files}")
