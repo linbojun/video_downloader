@@ -81,8 +81,8 @@ def main():
         '--browser-type',
         type=str,
         choices=['chromium', 'firefox', 'webkit'],
-        default='chromium',
-        help='浏览器类型 (默认: chromium)'
+        default='firefox',
+        help='浏览器类型 (默认: firefox)'
     )
     
     parser.add_argument(

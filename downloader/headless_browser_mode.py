@@ -123,7 +123,7 @@ class HeadlessBrowserDownloader:
     def __init__(
         self,
         headless: bool = True,
-        browser_type: str = "chromium",
+        browser_type: str = "firefox",
         browser_channel: Optional[str] = None,
         user_agent: Optional[str] = None,
         enable_stealth: bool = True,
@@ -136,7 +136,7 @@ class HeadlessBrowserDownloader:
         
         Args:
             headless: 是否使用无头模式
-            browser_type: 浏览器类型 ("chromium", "firefox", "webkit")
+            browser_type: 浏览器类型 ("chromium", "firefox", "webkit"，默认: "firefox")
             browser_channel: 浏览器通道 (仅对 chromium 生效，如 "chrome"、"msedge")
             user_agent: 自定义 UA
             enable_stealth: 是否开启 Anti-automation 补丁（默认开启，仅对 chromium 生效）
@@ -157,6 +157,8 @@ class HeadlessBrowserDownloader:
         self.video_request_meta: Dict[str, Dict[str, str]] = {}
         self.target_url: Optional[str] = None
         self.target_origin: Optional[str] = None
+        self.playwright_context_manager = None  # 用于保持 Playwright 上下文管理器打开
+        self.playwright_instance = None  # 已进入的 Playwright 实例
         self.user_agent = user_agent
         self.enable_stealth = enable_stealth and browser_type == "chromium"
         if self.enable_stealth and not self.user_agent:
@@ -201,13 +203,14 @@ class HeadlessBrowserDownloader:
         except Exception as e:
             logger.debug(f"处理响应时出错: {e}")
     
-    async def collect_video_urls(self, url: str, timeout: int = 90000) -> List[str]:
+    async def collect_video_urls(self, url: str, timeout: int = 90000, keep_browser_open: bool = False) -> List[str]:
         """
         打开网页，监听网络，收集视频 URL 列表
         
         Args:
             url: 目标网页URL
             timeout: 超时时间（毫秒）
+            keep_browser_open: 是否保持浏览器打开（不自动关闭）
             
         Returns:
             List[str]: 收集到的视频URL列表
@@ -219,82 +222,106 @@ class HeadlessBrowserDownloader:
         self.target_origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else None
         
         try:
-            async with async_playwright() as p:
-                # 启动浏览器
-                launch_kwargs = {"headless": self.headless}
-                context_kwargs = self._build_context_kwargs()
-                
-                if self.browser_channel and self.browser_type != "chromium":
-                    logger.warning(
-                        "browser_channel 仅对 chromium 生效，已忽略该参数"
+            if keep_browser_open and self.playwright_instance:
+                # 使用已存在的 Playwright 实例
+                p = self.playwright_instance
+            else:
+                # 创建新的 Playwright 上下文管理器
+                playwright_cm = async_playwright()
+                p = await playwright_cm.__aenter__()
+                if keep_browser_open:
+                    # 保存上下文管理器和实例以便后续清理
+                    self.playwright_context_manager = playwright_cm
+                    self.playwright_instance = p
+            
+            # 启动浏览器
+            launch_kwargs = {"headless": self.headless}
+            context_kwargs = self._build_context_kwargs()
+            
+            if self.browser_channel and self.browser_type != "chromium":
+                logger.warning(
+                    "browser_channel 仅对 chromium 生效，已忽略该参数"
+                )
+            
+            if self.browser_type == "chromium":
+                launch_args = self._build_launch_args()
+                if launch_args:
+                    existing_args = launch_kwargs.get("args", [])
+                    launch_kwargs["args"] = [*existing_args, *launch_args]
+                if self.browser_channel:
+                    launch_kwargs["channel"] = self.browser_channel
+                    logger.info(
+                        f"使用浏览器通道: {self.browser_channel}"
                     )
-                
-                if self.browser_type == "chromium":
-                    launch_args = self._build_launch_args()
-                    if launch_args:
-                        existing_args = launch_kwargs.get("args", [])
-                        launch_kwargs["args"] = [*existing_args, *launch_args]
-                    if self.browser_channel:
-                        launch_kwargs["channel"] = self.browser_channel
-                        logger.info(
-                            f"使用浏览器通道: {self.browser_channel}"
-                        )
-                    if self.user_data_dir:
-                        logger.info(
-                            f"复用用户数据目录: {self.user_data_dir}"
-                        )
-                        self.context = await p.chromium.launch_persistent_context(
-                            str(self.user_data_dir),
-                            **launch_kwargs,
-                            **context_kwargs,
-                        )
-                        self.browser = self.context.browser
-                    else:
-                        self.browser = await p.chromium.launch(**launch_kwargs)
-                        self.context = await self.browser.new_context(**context_kwargs)
-                elif self.browser_type == "firefox":
-                    self.browser = await p.firefox.launch(**launch_kwargs)
-                    self.context = await self.browser.new_context(**context_kwargs)
-                elif self.browser_type == "webkit":
-                    self.browser = await p.webkit.launch(**launch_kwargs)
-                    self.context = await self.browser.new_context(**context_kwargs)
+                if self.user_data_dir:
+                    logger.info(
+                        f"复用用户数据目录: {self.user_data_dir}"
+                    )
+                    self.context = await p.chromium.launch_persistent_context(
+                        str(self.user_data_dir),
+                        **launch_kwargs,
+                        **context_kwargs,
+                    )
+                    self.browser = self.context.browser
                 else:
-                    raise ValueError(f"不支持的浏览器类型: {self.browser_type}")
-                
-                logger.info(f"启动浏览器: {self.browser_type} (headless={self.headless})")
-                
-                if self.enable_stealth:
-                    await self._apply_stealth_polyfills()
-                self.page = await self.context.new_page()
-                
-                # 监听响应
-                self.page.on("response", self._handle_response)
-                
-                logger.info(f"正在访问: {url}")
-                # 访问页面
-                await self.page.goto(url, wait_until="networkidle", timeout=timeout)
-                
-                # 等待一段时间以捕获延迟加载的视频
-                logger.info("等待页面加载完成...")
-                await asyncio.sleep(5)
-                
-                # 尝试滚动页面以触发懒加载
+                    self.browser = await p.chromium.launch(**launch_kwargs)
+                    self.context = await self.browser.new_context(**context_kwargs)
+            elif self.browser_type == "firefox":
+                self.browser = await p.firefox.launch(**launch_kwargs)
+                self.context = await self.browser.new_context(**context_kwargs)
+            elif self.browser_type == "webkit":
+                self.browser = await p.webkit.launch(**launch_kwargs)
+                self.context = await self.browser.new_context(**context_kwargs)
+            else:
+                raise ValueError(f"不支持的浏览器类型: {self.browser_type}")
+            
+            logger.info(f"启动浏览器: {self.browser_type} (headless={self.headless})")
+            
+            if self.enable_stealth:
+                await self._apply_stealth_polyfills()
+            self.page = await self.context.new_page()
+            
+            # 监听响应
+            self.page.on("response", self._handle_response)
+            
+            logger.info(f"正在访问: {url}")
+            # 访问页面
+            await self.page.goto(url, wait_until="networkidle", timeout=timeout)
+            
+            # 等待一段时间以捕获延迟加载的视频
+            logger.info("等待页面加载完成...")
+            await asyncio.sleep(5)
+            
+            # 尝试滚动页面以触发懒加载
+            try:
+                await self.page.evaluate("""
+                    () => {
+                        window.scrollTo(0, document.body.scrollHeight);
+                        return new Promise(resolve => setTimeout(resolve, 2000));
+                    }
+                """)
+                await self.page.evaluate("window.scrollTo(0, 0)")
+                await asyncio.sleep(2)
+            except Exception as e:
+                logger.debug(f"滚动页面时出错: {e}")
+            
+            if not keep_browser_open:
+                # 自动关闭浏览器和 Playwright
+                await self._cleanup_resources()
                 try:
-                    await self.page.evaluate("""
-                        () => {
-                            window.scrollTo(0, document.body.scrollHeight);
-                            return new Promise(resolve => setTimeout(resolve, 2000));
-                        }
-                    """)
-                    await self.page.evaluate("window.scrollTo(0, 0)")
-                    await asyncio.sleep(2)
-                except Exception as e:
-                    logger.debug(f"滚动页面时出错: {e}")
-
+                    await playwright_cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
+                        
         except Exception as e:
             logger.error(f"收集视频URL时出错: {e}")
-        finally:
-            await self._cleanup_resources()
+            if not keep_browser_open:
+                await self._cleanup_resources()
+                try:
+                    if 'playwright_cm' in locals():
+                        await playwright_cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
         
         video_urls_list = list(self.video_urls)
         logger.info(f"共收集到 {len(video_urls_list)} 个视频URL")
@@ -316,6 +343,15 @@ class HeadlessBrowserDownloader:
                 pass
             finally:
                 self.browser = None
+        # 关闭 Playwright 上下文管理器（如果存在）
+        if self.playwright_context_manager:
+            try:
+                await self.playwright_context_manager.__aexit__(None, None, None)
+            except Exception:
+                pass
+            finally:
+                self.playwright_context_manager = None
+                self.playwright_instance = None
     
     def _build_launch_args(self) -> List[str]:
         """构建 Chromium 启动参数，移除 --enable-automation 等标记"""
@@ -469,20 +505,48 @@ class HeadlessBrowserDownloader:
         downloaded_files: List[str] = []
         total = len(filtered_urls)
         
-        for i, url in enumerate(filtered_urls):
-            headers = headers_map.get(url)
-            try:
-                file_path = download_video(
-                    url,
-                    output_dir,
-                    index=i if total > 1 else None,
-                    headers=headers,
-                )
-            except Exception as err:
-                logger.error(f"直接下载失败 {url}: {err}")
-                file_path = None
-            if file_path:
-                downloaded_files.append(file_path)
+        # 显示总体下载进度
+        try:
+            from tqdm import tqdm
+            TQDM_AVAILABLE = True
+        except ImportError:
+            TQDM_AVAILABLE = False
+            tqdm = lambda x, **kwargs: x
+        
+        if TQDM_AVAILABLE and total > 1:
+            pbar = tqdm(
+                total=total,
+                desc="总体下载进度",
+                unit="文件",
+                ncols=100,
+                position=0,
+                leave=True
+            )
+        else:
+            pbar = None
+        
+        try:
+            for i, url in enumerate(filtered_urls):
+                headers = headers_map.get(url)
+                try:
+                    file_path = download_video(
+                        url,
+                        output_dir,
+                        index=i if total > 1 else None,
+                        headers=headers,
+                    )
+                except Exception as err:
+                    logger.error(f"直接下载失败 {url}: {err}")
+                    file_path = None
+                if file_path:
+                    downloaded_files.append(file_path)
+                
+                if pbar:
+                    pbar.update(1)
+                    pbar.set_postfix({"已完成": f"{len(downloaded_files)}/{total}"})
+        finally:
+            if pbar:
+                pbar.close()
         
         if not downloaded_files:
             logger.error("所有下载尝试均失败")
@@ -510,6 +574,7 @@ class HeadlessBrowserDownloader:
         Args:
             url: 目标网页URL
             output_dir: 输出目录
+            timeout: 超时时间（毫秒）
         """
         logger.info("=" * 60)
         logger.info("开始执行无头浏览器模式")
@@ -517,18 +582,33 @@ class HeadlessBrowserDownloader:
         logger.info(f"输出目录: {output_dir}")
         logger.info("=" * 60)
         
-        # 1. 收集视频URL
-        video_urls = await self.collect_video_urls(url, timeout=timeout)
-        
-        if not video_urls:
-            logger.warning("未找到任何视频URL，请检查：")
-            logger.warning("1. 网站是否使用了DRM保护")
-            logger.warning("2. 是否需要登录")
-            logger.warning("3. 视频是否为动态加载")
-            return
-        
-        # 2. 下载视频
-        await self.download_videos(video_urls, output_dir)
+        try:
+            # 1. 收集视频URL（保持浏览器打开）
+            video_urls = await self.collect_video_urls(url, timeout=timeout, keep_browser_open=True)
+            
+            if not video_urls:
+                logger.warning("未找到任何视频URL，请检查：")
+                logger.warning("1. 网站是否使用了DRM保护")
+                logger.warning("2. 是否需要登录")
+                logger.warning("3. 视频是否为动态加载")
+                await self._cleanup_resources()
+                return
+            
+            # 2. 下载视频（浏览器保持打开）
+            await self.download_videos(video_urls, output_dir)
+            
+            # 3. 等待 30 秒后关闭浏览器（给用户时间查看页面或调试）
+            if not self.headless:
+                logger.info("下载已开始，浏览器将在 30 秒后自动关闭...")
+            else:
+                logger.info("下载已开始，将在 30 秒后关闭浏览器...")
+            await asyncio.sleep(30)
+            
+        except Exception as e:
+            logger.error(f"执行过程中出错: {e}", exc_info=True)
+        finally:
+            # 关闭浏览器和 Playwright
+            await self._cleanup_resources()
     
     def run(self, url: str, output_dir: str, timeout: int = 90000) -> None:
         """

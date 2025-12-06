@@ -5,9 +5,27 @@ import os
 import subprocess
 import logging
 import requests
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+    # 创建一个简单的占位符类
+    class tqdm:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def update(self, n=1):
+            pass
+        def set_description(self, desc):
+            pass
 
 logger = logging.getLogger(__name__)
 
@@ -25,12 +43,14 @@ def download_mp4(
         url: 视频URL
         output_path: 输出文件路径
         chunk_size: 下载块大小
+        headers: HTTP 请求头
         
     Returns:
         bool: 是否下载成功
     """
     try:
-        logger.info(f"开始下载 MP4: {url}")
+        filename = os.path.basename(output_path)
+        logger.info(f"开始下载 MP4: {filename}")
         response = requests.get(url, stream=True, timeout=30, headers=headers)
         response.raise_for_status()
         
@@ -39,16 +59,51 @@ def download_mp4(
         
         os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
         
+        # 使用 tqdm 显示进度条
         with open(output_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=chunk_size):
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if total_size > 0:
-                        percent = (downloaded / total_size) * 100
-                        logger.debug(f"下载进度: {percent:.1f}%")
+            if TQDM_AVAILABLE and total_size > 0:
+                # 有文件大小信息，显示进度条
+                with tqdm(
+                    total=total_size,
+                    unit='B',
+                    unit_scale=True,
+                    unit_divisor=1024,
+                    desc=f"下载 {filename[:30]}",
+                    ncols=100,
+                    miniters=1
+                ) as pbar:
+                    for chunk in response.iter_content(chunk_size=chunk_size):
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            pbar.update(len(chunk))
+            else:
+                # 没有文件大小信息或 tqdm 不可用，显示简单进度
+                if TQDM_AVAILABLE:
+                    with tqdm(
+                        unit='B',
+                        unit_scale=True,
+                        unit_divisor=1024,
+                        desc=f"下载 {filename[:30]}",
+                        ncols=100
+                    ) as pbar:
+                        for chunk in response.iter_content(chunk_size=chunk_size):
+                            if chunk:
+                                f.write(chunk)
+                                downloaded += len(chunk)
+                                pbar.update(len(chunk))
+                else:
+                    # 回退到简单日志
+                    for chunk in response.iter_content(chunk_size=chunk_size):
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if total_size > 0:
+                                percent = (downloaded / total_size) * 100
+                                if downloaded % (chunk_size * 100) == 0:  # 每100个chunk打印一次
+                                    logger.info(f"下载进度: {percent:.1f}% ({downloaded}/{total_size} bytes)")
         
-        logger.info(f"MP4 下载完成: {output_path}")
+        logger.info(f"MP4 下载完成: {filename}")
         return True
     except Exception as e:
         logger.error(f"下载 MP4 失败 {url}: {e}")
@@ -67,7 +122,8 @@ def download_m3u8(url: str, output_path: str) -> bool:
         bool: 是否下载成功
     """
     try:
-        logger.info(f"开始下载 m3u8: {url}")
+        filename = os.path.basename(output_path)
+        logger.info(f"开始下载 m3u8: {filename}")
         
         # 检查 ffmpeg 是否可用
         if not check_ffmpeg_available():
@@ -82,23 +138,130 @@ def download_m3u8(url: str, output_path: str) -> bool:
             '-y',  # 覆盖输出文件
             '-i', url,
             '-c', 'copy',  # 直接复制流，不重新编码
+            '-progress', 'pipe:1',  # 将进度输出到 stdout
+            '-loglevel', 'error',  # 只显示错误信息
             output_path
         ]
         
         logger.debug(f"执行命令: {' '.join(cmd)}")
-        result = subprocess.run(
+        
+        # 启动进程并实时读取进度
+        process = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=600  # 10分钟超时
+            bufsize=1
         )
         
-        if result.returncode == 0:
-            logger.info(f"m3u8 下载完成: {output_path}")
-            return True
-        else:
-            logger.error(f"ffmpeg 执行失败: {result.stderr}")
-            return False
+        # 解析 ffmpeg 进度输出
+        duration = None
+        current_time = None
+        pbar = None
+        
+        if TQDM_AVAILABLE:
+            pbar = tqdm(
+                desc=f"下载 m3u8 {filename[:30]}",
+                unit='',
+                ncols=100,
+                bar_format='{desc}: {percentage:3.0f}%|{bar}| {elapsed}',
+                total=100
+            )
+        
+        stderr_lines = []
+        try:
+            # 使用线程读取 stderr（ffmpeg 将进度信息输出到 stderr）
+            import threading
+            import queue
+            
+            stderr_queue = queue.Queue()
+            
+            def read_stderr():
+                """在单独线程中读取 stderr"""
+                for line in iter(process.stderr.readline, ''):
+                    if line:
+                        stderr_queue.put(line)
+                process.stderr.close()
+            
+            # 启动读取线程
+            stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+            stderr_thread.start()
+            
+            # 解析进度信息
+            last_percent = -1
+            while True:
+                try:
+                    # 从队列获取一行（带超时）
+                    line = stderr_queue.get(timeout=0.5)
+                    stderr_lines.append(line)
+                    
+                    # 解析 duration
+                    if 'Duration:' in line:
+                        match = re.search(r'Duration: (\d{2}):(\d{2}):(\d{2})\.(\d{2})', line)
+                        if match:
+                            hours, minutes, seconds, centiseconds = map(int, match.groups())
+                            duration = hours * 3600 + minutes * 60 + seconds + centiseconds / 100
+                            if TQDM_AVAILABLE and pbar and duration:
+                                pbar.total = 100
+                                pbar.unit = '%'
+                    
+                    # 解析当前时间
+                    if 'time=' in line:
+                        match = re.search(r'time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})', line)
+                        if match:
+                            hours, minutes, seconds, centiseconds = map(int, match.groups())
+                            current_time = hours * 3600 + minutes * 60 + seconds + centiseconds / 100
+                            if TQDM_AVAILABLE and pbar and duration and current_time:
+                                percent = (current_time / duration) * 100
+                                pbar.n = percent
+                                pbar.set_postfix({"时间": f"{current_time:.1f}s/{duration:.1f}s"})
+                                pbar.refresh()
+                            elif not TQDM_AVAILABLE and duration and current_time:
+                                percent = (current_time / duration) * 100
+                                if int(percent) != last_percent and int(percent) % 10 == 0:  # 每10%打印一次
+                                    logger.info(f"下载进度: {percent:.1f}% ({current_time:.1f}s/{duration:.1f}s)")
+                                    last_percent = int(percent)
+                
+                except queue.Empty:
+                    # 检查进程是否完成
+                    if process.poll() is not None:
+                        break
+                    continue
+            
+            # 等待线程完成
+            stderr_thread.join(timeout=1)
+            
+            # 读取剩余输出
+            while not stderr_queue.empty():
+                try:
+                    line = stderr_queue.get_nowait()
+                    stderr_lines.append(line)
+                except queue.Empty:
+                    break
+            
+            # 等待进程完成
+            returncode = process.wait()
+            
+            if TQDM_AVAILABLE and pbar:
+                pbar.n = 100
+                pbar.refresh()
+                pbar.close()
+            
+            if returncode == 0:
+                logger.info(f"m3u8 下载完成: {filename}")
+                return True
+            else:
+                stderr_output = ''.join(stderr_lines)
+                logger.error(f"ffmpeg 执行失败: {stderr_output[-500:]}")  # 只显示最后500字符
+                return False
+                
+        except Exception as e:
+            if process.poll() is None:
+                process.kill()
+            if TQDM_AVAILABLE and pbar:
+                pbar.close()
+            logger.error(f"下载过程中出错: {e}")
+            raise e
             
     except subprocess.TimeoutExpired:
         logger.error(f"下载 m3u8 超时: {url}")

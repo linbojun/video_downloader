@@ -13,6 +13,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - 支持多种命名模式（index0.ts, index1.ts 或 index_50.ts, index_51.ts 等）
   - 合并成功后自动删除原始 .ts 文件
   - 使用 ffmpeg concat demuxer 进行高效合并（无需重新编码）
+- **浏览器延迟关闭功能**：下载开始后，浏览器会在 30 秒后自动关闭
+  - 方便用户在非无头模式下查看页面或进行调试
+  - 适用于所有浏览器类型（Firefox、Chromium、Webkit）
+- **下载进度显示功能**：添加实时下载进度条和百分比显示
+  - MP4 文件下载：显示文件大小、下载速度、进度百分比
+  - M3U8 流媒体下载：显示时间进度（已下载时间/总时长）和百分比
+  - 批量下载：显示总体下载进度（已完成文件数/总文件数）
+  - 使用 `tqdm` 库提供美观的进度条界面
+  - 如果 `tqdm` 未安装，自动回退到文本日志模式
+
+### Changed
+- **默认浏览器改为 Firefox**：将默认浏览器类型从 Chromium 改为 Firefox
 
 ### Fixed
 - 修复 m3u8 下载时输出文件扩展名问题，确保输出为 .mp4 格式而非 .m3u8 文件
